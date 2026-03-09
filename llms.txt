@@ -1,0 +1,245 @@
+# agentd API
+
+> Multi-agent thread daemon. Manages concurrent coding agent threads with persistent conversations, tool use, and real-time streaming.
+
+Base URL: `http://localhost:4747`
+
+## concepts
+
+A **thread** is a persistent conversation with a coding agent. Each thread has its own working directory, model configuration, and message history. Threads persist to disk and survive server restarts.
+
+Sending a message returns immediately (202). The agent's response streams asynchronously via SSE. The agent can read/write/edit files, run bash commands, and search code within the thread's working directory.
+
+## endpoints
+
+### list threads
+
+```
+GET /api/threads
+```
+
+Returns an array of thread summaries sorted by most recently updated.
+
+Response:
+```json
+[
+  {
+    "id": "uuid",
+    "title": "My Thread",
+    "cwd": "/path/to/project",
+    "provider": "anthropic",
+    "model": "claude-opus-4-20250514",
+    "thinkingLevel": "off",
+    "createdAt": "2025-01-01T00:00:00.000Z",
+    "updatedAt": "2025-01-01T00:00:00.000Z",
+    "status": "idle"
+  }
+]
+```
+
+`status` is either `"idle"` or `"streaming"`.
+
+### create thread
+
+```
+POST /api/threads
+Content-Type: application/json
+```
+
+Body (all fields optional):
+```json
+{
+  "title": "My Thread",
+  "cwd": "/path/to/project",
+  "provider": "anthropic",
+  "model": "claude-opus-4-20250514",
+  "thinkingLevel": "high"
+}
+```
+
+Defaults: title = "New Thread", cwd = server's working directory, provider = "anthropic", model = "claude-opus-4-20250514".
+
+Returns 201 with the thread metadata.
+
+### get thread
+
+```
+GET /api/threads/:id
+```
+
+Returns thread metadata, status, and full message history.
+
+Response:
+```json
+{
+  "id": "uuid",
+  "title": "My Thread",
+  "cwd": "/path/to/project",
+  "provider": "anthropic",
+  "model": "claude-opus-4-20250514",
+  "createdAt": "2025-01-01T00:00:00.000Z",
+  "updatedAt": "2025-01-01T00:00:00.000Z",
+  "status": "idle",
+  "messages": [
+    { "role": "user", "content": "Hello" },
+    { "role": "assistant", "content": [{ "type": "text", "text": "Hi!" }] }
+  ]
+}
+```
+
+Messages follow the Anthropic API message format. Assistant messages have content as an array of blocks (text, tool_use, thinking). Tool results appear as separate messages with role "toolResult".
+
+### delete thread
+
+```
+DELETE /api/threads/:id
+```
+
+Aborts any running agent, disposes resources, and removes the thread's data directory. Returns `{ "ok": true }`.
+
+### send message
+
+```
+POST /api/threads/:id/messages
+Content-Type: application/json
+```
+
+Body:
+```json
+{
+  "content": "Refactor the auth module to use JWT"
+}
+```
+
+Returns 202 immediately. The agent processes the message asynchronously. If the agent is already streaming, the message is queued and sent after the current response completes.
+
+Monitor the response via the SSE events endpoint.
+
+### abort
+
+```
+POST /api/threads/:id/abort
+```
+
+Aborts the agent's current run. Returns `{ "ok": true }`.
+
+### stream events (SSE)
+
+```
+GET /api/threads/:id/events
+```
+
+Server-Sent Events stream. Connect with EventSource:
+
+```js
+const es = new EventSource("/api/threads/{id}/events");
+es.addEventListener("snapshot", (e) => { /* ... */ });
+es.addEventListener("message_update", (e) => { /* ... */ });
+```
+
+Each SSE event has a named `event` type and JSON `data`.
+
+#### event types
+
+**snapshot** — sent immediately on connect
+```json
+{
+  "messages": [...],
+  "status": "idle",
+  "metadata": { "id": "...", "title": "...", ... }
+}
+```
+
+**agent_start** — agent begins processing
+```json
+{}
+```
+
+**message_update** — streaming text delta from the assistant
+```json
+{
+  "message": { "role": "assistant", "content": [...] },
+  "assistantMessageEvent": { "type": "text_delta", "delta": "partial text" }
+}
+```
+
+**tool_execution_start** — agent invokes a tool
+```json
+{
+  "toolCallId": "id",
+  "toolName": "edit",
+  "args": { "file": "src/auth.ts", ... }
+}
+```
+
+**tool_execution_end** — tool execution completed
+```json
+{
+  "toolCallId": "id",
+  "toolName": "edit",
+  "isError": false
+}
+```
+
+**message_end** — assistant message finalized
+```json
+{
+  "message": { "role": "assistant", "content": [...] }
+}
+```
+
+**agent_end** — agent finished processing (back to idle)
+```json
+{}
+```
+
+**ping** — keepalive every 15 seconds
+```json
+{}
+```
+
+## example: full workflow
+
+```sh
+# 1. create a thread
+curl -X POST http://localhost:4747/api/threads \
+  -H 'Content-Type: application/json' \
+  -d '{"title": "auth refactor", "cwd": "/home/user/myproject"}'
+# → {"id":"abc-123", ...}
+
+# 2. start streaming events (in another terminal)
+curl -N http://localhost:4747/api/threads/abc-123/events
+# → event: snapshot
+# → data: {"messages":[],"status":"idle","metadata":{...}}
+
+# 3. send a message
+curl -X POST http://localhost:4747/api/threads/abc-123/messages \
+  -H 'Content-Type: application/json' \
+  -d '{"content": "Add input validation to the login endpoint"}'
+# → 202 {"ok":true}
+
+# the SSE stream will emit:
+#   event: agent_start
+#   event: message_update (repeated, with text deltas)
+#   event: tool_execution_start (if agent uses tools)
+#   event: tool_execution_end
+#   event: message_end
+#   event: agent_end
+
+# 4. abort if needed
+curl -X POST http://localhost:4747/api/threads/abc-123/abort
+
+# 5. delete when done
+curl -X DELETE http://localhost:4747/api/threads/abc-123
+```
+
+## available tools
+
+Each thread's agent has access to these coding tools, scoped to the thread's working directory:
+
+- **bash** — execute shell commands
+- **read** — read file contents
+- **write** — write/create files
+- **edit** — apply targeted edits to files
+
+The agent decides which tools to use based on the conversation. Tool executions are reported via SSE events so clients can show progress.
